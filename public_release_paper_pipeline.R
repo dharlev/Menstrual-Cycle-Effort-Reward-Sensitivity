@@ -1,566 +1,601 @@
-#!/usr/bin/env Rscript
 
-suppressPackageStartupMessages({
-  library(dplyr)
-  library(tidyr)
-  library(readr)
-  library(stringr)
-  library(purrr)
-  library(ggplot2)
-  library(ggdist)
-  library(patchwork)
-  library(lme4)
-  library(lmerTest)
-  library(broom.mixed)
-  library(signal)
-  library(pracma)
-})
+# ============================================================================
+# 1. Analysis configuration
+# ============================================================================
 
-# -----------------------------------------------------------------------------
-# Paths
-# -----------------------------------------------------------------------------
+INPUT_FILE <- file.path("data", "raw", "dm_trials.csv")
+OUTPUT_DIR <- file.path("outputs", "dm_analysis")
+RUN_VISIT_ANALYSES <- TRUE
+TRIALS_PER_SESSION <- 44L
 
-project_dir <- "."
-raw_dir <- file.path(project_dir, "data", "raw")
-processed_dir <- file.path(project_dir, "data", "processed")
-figures_dir <- file.path(project_dir, "outputs", "figures")
-models_dir <- file.path(project_dir, "outputs", "models")
-tables_dir <- file.path(project_dir, "outputs", "tables")
+PRIMARY_SAMPLING <- list(
+  chains = 4L, parallel_chains = 4L,
+  iter_warmup = 1000L, iter_sampling = 1000L,
+  seed = 123L, adapt_delta = 0.95, max_treedepth = 12L
+)
+VISIT_SAMPLING <- list(
+  chains = 4L, parallel_chains = 4L,
+  iter_warmup = 1000L, iter_sampling = 1000L,
+  seed = 20260910L, adapt_delta = 0.99, max_treedepth = 12L
+)
 
-dir.create(processed_dir, recursive = TRUE, showWarnings = FALSE)
-dir.create(figures_dir, recursive = TRUE, showWarnings = FALSE)
-dir.create(models_dir, recursive = TRUE, showWarnings = FALSE)
-dir.create(tables_dir, recursive = TRUE, showWarnings = FALSE)
-
-# -----------------------------------------------------------------------------
-# Constants
-# -----------------------------------------------------------------------------
-
-phase_levels <- c("Follicular", "Luteal")
-phase_labels <- c(Follicular = "Late-follicular", Luteal = "Mid-luteal")
-
-col_fol <- "#4FA8D5"
-col_fol_soft <- "#D5EAF6"
-col_lut <- "#F28E72"
-col_lut_soft <- "#F8D5C8"
-col_contrast <- "#8E6BBE"
-
-ep_outlier_sd <- 2.5
-min_rr_baseline <- 30L
-min_rr_active <- 10L
-n_boot <- 4000L
-seed_base <- 20260605L
-
-# -----------------------------------------------------------------------------
-# Utilities
-# -----------------------------------------------------------------------------
-
-read_csv_clean <- function(path) {
-  readr::read_csv(path, show_col_types = FALSE, progress = FALSE)
+check_packages <- function(include_visit) {
+  packages <- c("cmdstanr", "posterior", "dplyr", "readr")
+  if (include_visit) packages <- c(packages, "lme4", "lmerTest", "broom.mixed")
+  missing <- packages[!vapply(packages, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing)) {
+    stop("Install required packages: ", paste(missing, collapse = ", "), call. = FALSE)
+  }
+  invisible(packages)
 }
 
-require_columns <- function(df, cols, name) {
-  missing_cols <- setdiff(cols, names(df))
-  if (length(missing_cols) > 0) {
-    stop(sprintf("%s is missing columns: %s", name, paste(missing_cols, collapse = ", ")), call. = FALSE)
+require_condition <- function(condition, message) {
+  if (!isTRUE(condition)) stop(message, call. = FALSE)
+}
+
+require_columns <- function(data, columns) {
+  absent <- setdiff(columns, names(data))
+  if (length(absent)) {
+    stop("Input is missing columns: ", paste(absent, collapse = ", "), call. = FALSE)
   }
 }
 
-z_score <- function(x) {
-  as.numeric(scale(x))
-}
+# ============================================================================
+# 2. Input checks, session indexing, and offer normalisation
+# ============================================================================
+# These checks concern data structure and coding, not the direction, size,
+# or statistical significance of any result. No rows are selected by outcome.
+# Each trial must have the same pair of offers across sessions.
+# Reward is divided by the larger reward WITHIN each offered pair.
+# Effort is divided by 100; it is squared later in the Stan value function.
 
-boot_mean_draws <- function(x, n = n_boot, seed = seed_base) {
-  x <- x[is.finite(x)]
-  set.seed(seed)
-  replicate(n, mean(sample(x, length(x), replace = TRUE), na.rm = TRUE))
-}
-
-summary_to_draws <- function(mean, lower, upper, n = n_boot, seed = seed_base) {
-  sd_approx <- (upper - lower) / (2 * qnorm(0.975))
-  set.seed(seed)
-  rnorm(n, mean = mean, sd = sd_approx)
-}
-
-tidy_lmm <- function(model, label) {
-  broom.mixed::tidy(model, effects = "fixed", conf.int = TRUE) %>%
-    mutate(model = label)
-}
-
-theme_pub <- function(base_size = 11.5) {
-  theme_minimal(base_size = base_size) +
-    theme(
-      panel.grid.minor = element_blank(),
-      panel.grid.major.y = element_blank(),
-      axis.text = element_text(color = "black"),
-      axis.title = element_text(color = "black"),
-      plot.title = element_text(face = "bold", hjust = 0),
-      strip.text = element_text(face = "bold"),
-      strip.background = element_blank(),
-      legend.title = element_text(face = "bold")
-    )
-}
-
-tag_panel <- function(p, tag) {
-  p + labs(tag = tag) +
-    theme_pub() +
-    theme(plot.tag = element_text(face = "bold", size = 15))
-}
-
-save_plot_pair <- function(plot_obj, stem, width, height) {
-  ggsave(file.path(figures_dir, paste0(stem, ".png")), plot_obj, width = width, height = height, dpi = 320)
-  ggsave(file.path(figures_dir, paste0(stem, ".pdf")), plot_obj, width = width, height = height)
-}
-
-# -----------------------------------------------------------------------------
-# ECG / HRV
-# -----------------------------------------------------------------------------
-
-bandpass_ecg <- function(ecg, fs, low = 0.5, high = 40, order = 2) {
-  wn <- c(low, high) / (fs / 2)
-  filt <- signal::butter(order, wn, type = "pass")
-  as.numeric(signal::filtfilt(filt, ecg))
-}
-
-detect_r_peaks <- function(ecg_filt, fs, min_distance_sec = 0.30, min_prominence = NULL) {
-  if (is.null(min_prominence)) {
-    min_prominence <- 0.35 * stats::sd(ecg_filt, na.rm = TRUE)
-  }
-
-  peak_mat <- pracma::findpeaks(
-    ecg_filt,
-    minpeakdistance = round(min_distance_sec * fs),
-    minpeakheight = stats::median(ecg_filt, na.rm = TRUE) + min_prominence
+prepare_choice_data <- function(input_file, include_visit = TRUE) {
+  x <- readr::read_csv(
+    input_file, show_col_types = FALSE, progress = FALSE,
+    col_types = readr::cols(participant_id = readr::col_character(),
+                           phase = readr::col_character())
   )
-
-  if (is.null(peak_mat)) {
-    return(integer(0))
+  require_condition(nrow(readr::problems(x)) == 0L,
+                    "Input contains CSV parsing errors; check column types.")
+  required <- c("participant_id", "phase", "trial_num", "option_chosen",
+                "reward1", "reward2", "effort1", "effort2")
+  if (include_visit) {
+    required <- c(required, "visit", "is_force_exerted", "surpassed_goal")
   }
+  require_columns(x, required)
+  x <- x[, required]
+  x$phase <- dplyr::recode(x$phase, LF = "Follicular", ML = "Luteal")
+  choice_columns <- c("participant_id", "phase", "trial_num", "option_chosen",
+                      "reward1", "reward2", "effort1", "effort2")
+  require_condition(nrow(x) > 0L && !anyNA(x[choice_columns]),
+                    "Choice input is empty or has missing required values.")
+  require_condition(all(nzchar(trimws(x$participant_id))), "Participant IDs cannot be blank.")
+  require_condition(all(x$phase %in% c("Follicular", "Luteal")),
+                    "phase must be LF/Follicular or ML/Luteal.")
+  numeric_columns <- c("trial_num", "option_chosen", "reward1", "reward2", "effort1", "effort2")
+  require_condition(all(vapply(x[numeric_columns], is.numeric, logical(1))),
+                    "Trial numbers, choices, rewards, and efforts must be numeric.")
+  require_condition(all(is.finite(as.matrix(x[numeric_columns]))),
+                    "Numeric choice input must be finite.")
+  require_condition(all(x$option_chosen %in% c(0, 1)), "Choices must be coded 0 or 1.")
+  require_condition(all(x$trial_num %in% seq_len(TRIALS_PER_SESSION)),
+                    "Trial numbers must be integers from 1 through 44.")
+  require_condition(all(x$reward1 >= 0 & x$reward2 >= 0), "Rewards cannot be negative.")
+  require_condition(all(x$effort1 >= 0 & x$effort1 <= 100 &
+                        x$effort2 >= 0 & x$effort2 <= 100),
+                    "Effort must be recorded as percent MVC, from 0 to 100.")
+  require_condition(!anyDuplicated(x[c("participant_id", "phase", "trial_num")]),
+                    "Participant/phase/trial rows must be unique.")
 
-  as.integer(peak_mat[, 2])
-}
+  x$phase <- factor(x$phase, levels = c("Follicular", "Luteal"))
+  counts <- dplyr::count(x, participant_id, phase, name = "n_trials")
+  require_condition(all(counts$n_trials == TRIALS_PER_SESSION) &&
+                      all(table(counts$participant_id) == 2L),
+                    "Each participant must have two complete phase sessions.")
 
-clean_rr_intervals <- function(rr_sec) {
-  rr_sec <- rr_sec[is.finite(rr_sec)]
-  rr_sec <- rr_sec[rr_sec >= 0.30 & rr_sec <= 1.50]
-  if (length(rr_sec) < 3) {
-    return(numeric(0))
-  }
-  rr_med <- stats::median(rr_sec, na.rm = TRUE)
-  rr_sec[rr_sec >= 0.80 * rr_med & rr_sec <= 1.20 * rr_med]
-}
+  subjects <- x |>
+    dplyr::distinct(participant_id) |>
+    dplyr::arrange(participant_id) |>
+    dplyr::mutate(subj_idx = dplyr::row_number())
+  sessions <- x |>
+    dplyr::distinct(participant_id, phase) |>
+    dplyr::left_join(subjects, by = "participant_id") |>
+    dplyr::arrange(participant_id, phase) |>
+    dplyr::mutate(session_idx = dplyr::row_number(),
+                  phase01 = as.integer(phase == "Luteal"))
 
-compute_rmssd <- function(rr_sec) {
-  if (length(rr_sec) < 2) {
-    return(NA_real_)
-  }
-  sqrt(mean(diff(rr_sec)^2, na.rm = TRUE))
-}
-
-process_ecg_segment <- function(path, sampling_rate) {
-  ecg <- read_csv_clean(path)
-  signal_col <- names(ecg)[1]
-  ecg_vec <- as.numeric(ecg[[signal_col]])
-  ecg_filt <- bandpass_ecg(ecg_vec, fs = sampling_rate)
-  r_idx <- detect_r_peaks(ecg_filt, fs = sampling_rate)
-  rr_raw <- diff(r_idx) / sampling_rate
-  rr_clean <- clean_rr_intervals(rr_raw)
-
-  tibble(
-    r_peak_n = length(r_idx),
-    rr_clean_n = length(rr_clean),
-    rmssd = compute_rmssd(rr_clean)
+  template <- x |>
+    dplyr::distinct(trial_num, reward1, reward2, effort1, effort2) |>
+    dplyr::arrange(trial_num)
+  require_condition(nrow(template) == TRIALS_PER_SESSION,
+                    "Offer pairs must be identical across sessions at each trial number.")
+  pair_max <- pmax(template$reward1, template$reward2)
+  denominator <- ifelse(pair_max == 0, 1, pair_max)
+  template$rew1 <- template$reward1 / denominator
+  template$rew2 <- template$reward2 / denominator
+  template$eff1 <- template$effort1 / 100
+  template$eff2 <- template$effort2 / 100
+  indexed <- dplyr::left_join(
+    x, dplyr::select(sessions, participant_id, phase, session_idx),
+    by = c("participant_id", "phase")
   )
+  y <- matrix(NA_integer_, nrow = nrow(sessions), ncol = TRIALS_PER_SESSION)
+  y[cbind(indexed$session_idx, indexed$trial_num)] <- as.integer(indexed$option_chosen)
+  require_condition(!anyNA(y), "Choice matrix is incomplete.")
+
+  stan_data <- list(
+    N_subj = nrow(subjects), N_sess = nrow(sessions), T = TRIALS_PER_SESSION,
+    subj = as.integer(sessions$subj_idx), phase = sessions$phase01, y = y,
+    rew1 = as.array(template$rew1), rew2 = as.array(template$rew2),
+    eff1 = as.array(template$eff1), eff2 = as.array(template$eff2)
+  )
+  if (include_visit) {
+    require_condition(!anyNA(x$visit) && all(x$visit %in% c(1, 2)),
+                      "Chronological visit must be 1 or 2 on every trial.")
+    visits <- dplyr::distinct(x, participant_id, phase, visit)
+    require_condition(nrow(visits) == nrow(sessions) &&
+                        !anyDuplicated(visits[c("participant_id", "visit")]),
+                      "Each phase session must map to exactly one physical visit.")
+    sessions <- dplyr::left_join(sessions, visits, by = c("participant_id", "phase")) |>
+      dplyr::arrange(session_idx)
+  }
+  list(trials = x, sessions = sessions, template = template, stan_data = stan_data)
 }
 
-build_hrv_table <- function(ecg_index) {
-  require_columns(
-    ecg_index,
-    c("subject", "session_id", "phase", "sampling_rate", "baseline_file", "active_file"),
-    "ecg_index"
-  )
+# ============================================================================
+# 3. Primary hierarchical Bayesian choice model
+# ============================================================================
+# For each option: V = reward sensitivity * normalised reward
+#                    - effort sensitivity * squared normalised effort.
+# P(choose option 2) = inverse-logit(V2 - V1).
+# Log sensitivities have population intercepts and ML-minus-LF phase effects.
+# Four correlated participant effects represent reward/effort intercepts and
+# reward/effort phase slopes. Priors are specified in the Stan model below.
+# LF = 0 and ML = 1. Every test choice enters the likelihood, including catches.
 
-  purrr::pmap_dfr(
-    ecg_index,
-    function(subject, session_id, phase, sampling_rate, baseline_file, active_file, ...) {
-      baseline <- process_ecg_segment(file.path(raw_dir, baseline_file), sampling_rate)
-      active <- process_ecg_segment(file.path(raw_dir, active_file), sampling_rate)
+PRIMARY_STAN_CODE <- r"(
+data {
+  int<lower=1> N_subj;
+  int<lower=1> N_sess;
+  int<lower=1> T;
 
-      tibble(
-        subject = subject,
-        session_id = session_id,
-        phase = phase,
-        hrv_baseline = baseline$rmssd,
-        hrv_active = active$rmssd,
-        rr_clean_n_baseline = baseline$rr_clean_n,
-        rr_clean_n_active = active$rr_clean_n,
-        ecg_ok_baseline = baseline$r_peak_n > 1 && baseline$rr_clean_n >= min_rr_baseline,
-        ecg_ok_active = active$r_peak_n > 1 && baseline$rr_clean_n >= 1 && active$rr_clean_n >= min_rr_active
-      )
+  array[N_sess] int<lower=1, upper=N_subj> subj;
+  array[N_sess] int<lower=0, upper=1> phase;
+
+  array[N_sess, T] int<lower=0, upper=1> y;
+
+  array[T] real rew1;
+  array[T] real rew2;
+  array[T] real eff1;
+  array[T] real eff2;
+}
+
+parameters {
+  vector[2] mu_base;                 // baseline means: [reward, effort]
+  vector[2] mu_phase;                // phase means:    [reward, effort]
+
+  vector<lower=0>[4] sigma_subj;     // SDs for 4 subject-level effects
+  cholesky_factor_corr[4] L_subj;    // correlations between them
+  matrix[4, N_subj] z_subj;          // subject latent z-scores
+}
+
+transformed parameters {
+  matrix[4, N_subj] subj_eff;
+
+  vector[N_sess] rewSens;
+  vector[N_sess] effSens;
+
+  subj_eff = diag_pre_multiply(sigma_subj, L_subj) * z_subj;
+
+  for (n in 1:N_sess) {
+    int s = subj[n];
+    real ph = phase[n];
+
+    real theta_rew =
+      mu_base[1] +
+      subj_eff[1, s] +
+      (mu_phase[1] + subj_eff[3, s]) * ph;
+
+    real theta_eff =
+      mu_base[2] +
+      subj_eff[2, s] +
+      (mu_phase[2] + subj_eff[4, s]) * ph;
+
+    rewSens[n] = exp(theta_rew);
+    effSens[n] = exp(theta_eff);
+  }
+}
+
+model {
+  mu_base ~ normal(0, 1);
+  mu_phase ~ normal(0, 0.5);
+
+  sigma_subj ~ exponential(1);
+  L_subj ~ lkj_corr_cholesky(2.0);
+
+  to_vector(z_subj) ~ std_normal();
+
+  for (n in 1:N_sess) {
+    for (t in 1:T) {
+      real V1;
+      real V2;
+
+      V1 = rewSens[n] * rew1[t] - effSens[n] * square(eff1[t]);
+      V2 = rewSens[n] * rew2[t] - effSens[n] * square(eff2[t]);
+
+      y[n, t] ~ bernoulli_logit(V2 - V1);
     }
-  )
+  }
 }
 
-# -----------------------------------------------------------------------------
-# Inputs
-# -----------------------------------------------------------------------------
+generated quantities {
+  real delta_rew = mu_phase[1];
+  real delta_eff = mu_phase[2];
 
-phase_schedule <- read_csv_clean(file.path(raw_dir, "phase_schedule.csv"))
-er_trials_raw <- read_csv_clean(file.path(raw_dir, "er_trials.csv"))
-dm_trials_raw <- read_csv_clean(file.path(raw_dir, "dm_trials.csv"))
-clinical_raw <- read_csv_clean(file.path(raw_dir, "clinical_subject_phase.csv"))
-ema_raw <- read_csv_clean(file.path(raw_dir, "ema_subject_phase.csv"))
+  real delta_rew_exp = exp(mu_phase[1]);
+  real delta_eff_exp = exp(mu_phase[2]);
 
-require_columns(phase_schedule, c("subject", "session_id", "phase", "phase_verified", "phase_target"), "phase_schedule")
-require_columns(er_trials_raw, c("subject", "session_id", "phase", "trial_num", "force", "scale_rating", "is_practice", "vas_rt", "surpassed_goal"), "er_trials")
-require_columns(dm_trials_raw, c("subject", "session_id", "phase", "trial_num", "effort1", "effort2", "reward1", "reward2", "option_chosen", "is_practice", "surpassed_goal", "choice_rt"), "dm_trials")
-require_columns(clinical_raw, c("subject", "session_id", "phase", "DRSP_Score", "AMI_Score"), "clinical_subject_phase")
-require_columns(ema_raw, c("subject", "session_id", "phase", "arousal_mean_z", "arousal_sd_z", "valence_mean_z", "valence_sd_z"), "ema_subject_phase")
+  corr_matrix[4] Omega_subj;
+  vector[N_sess] rewSens_sess;
+  vector[N_sess] effSens_sess;
 
-hrv_path <- file.path(raw_dir, "hrv_subject_phase.csv")
-ecg_index_path <- file.path(raw_dir, "ecg_index.csv")
+  real ybar_rep = 0;
+  real ybar_obs = 0;
+  int total = 0;
 
-if (file.exists(hrv_path)) {
-  hrv_raw <- read_csv_clean(hrv_path)
-  require_columns(
-    hrv_raw,
-    c("subject", "session_id", "phase", "hrv_baseline", "hrv_active", "rr_clean_n_baseline", "rr_clean_n_active", "ecg_ok_baseline", "ecg_ok_active"),
-    "hrv_subject_phase"
-  )
-} else if (file.exists(ecg_index_path)) {
-  ecg_index <- read_csv_clean(ecg_index_path)
-  hrv_raw <- build_hrv_table(ecg_index)
-  write_csv(hrv_raw, file.path(processed_dir, "hrv_subject_phase_from_ecg.csv"))
-} else {
-  stop("Provide either data/raw/hrv_subject_phase.csv or data/raw/ecg_index.csv.", call. = FALSE)
+  Omega_subj = multiply_lower_tri_self_transpose(L_subj);
+
+  for (n in 1:N_sess) {
+    rewSens_sess[n] = rewSens[n];
+    effSens_sess[n] = effSens[n];
+  }
+
+  for (n in 1:N_sess) {
+    for (t in 1:T) {
+      real V1;
+      real V2;
+      real p;
+      int y_rep;
+
+      V1 = rewSens[n] * rew1[t] - effSens[n] * square(eff1[t]);
+      V2 = rewSens[n] * rew2[t] - effSens[n] * square(eff2[t]);
+
+      p = inv_logit(V2 - V1);
+      y_rep = bernoulli_rng(p);
+
+      ybar_rep += y_rep;
+      ybar_obs += y[n, t];
+      total += 1;
+    }
+  }
+
+  ybar_rep /= total;
+  ybar_obs /= total;
 }
 
-# -----------------------------------------------------------------------------
-# Cohorts
-# -----------------------------------------------------------------------------
+)"
 
-strict_phase_subjects <- phase_schedule %>%
-  filter(phase_verified == TRUE, phase %in% phase_levels, phase_target %in% phase_levels) %>%
-  distinct(subject, phase) %>%
-  count(subject, name = "n_phase") %>%
-  filter(n_phase == 2) %>%
-  pull(subject)
+# ============================================================================
+# 4. Chronological-visit extension of the hierarchical model
+# ============================================================================
+# The likelihood, phase effects, participant effects, and their priors are the
+# same as above. A population visit-2 coefficient is added to each log
+# sensitivity, with a Normal(0, 0.5) prior. visit2 = physical visit minus one.
 
-# -----------------------------------------------------------------------------
-# EP
-# -----------------------------------------------------------------------------
+VISIT_STAN_CODE <- r"(
+data {
+  int<lower=1> N_subj;
+  int<lower=1> N_sess;
+  int<lower=1> T;
 
-er_trials <- er_trials_raw %>%
-  filter(subject %in% strict_phase_subjects, is_practice == 0) %>%
-  mutate(
-    subject = factor(subject),
-    phase = factor(phase, levels = phase_levels),
-    force_c = force - mean(force, na.rm = TRUE),
-    trial_num_c = trial_num - mean(trial_num, na.rm = TRUE)
-  ) %>%
-  left_join(clinical_raw, by = c("subject", "session_id", "phase")) %>%
-  left_join(ema_raw, by = c("subject", "session_id", "phase"))
+  array[N_sess] int<lower=1, upper=N_subj> subj;
+  array[N_sess] int<lower=0, upper=1> phase;
 
-ep_qc <- er_trials %>%
-  group_by(subject, phase) %>%
-  summarise(force_rating_cor = suppressWarnings(cor(force, scale_rating, use = "complete.obs")), .groups = "drop") %>%
-  group_by(subject) %>%
-  summarise(mean_force_rating_cor = mean(force_rating_cor, na.rm = TRUE), .groups = "drop") %>%
-  mutate(cor_z = z_score(mean_force_rating_cor))
+  array[N_sess, T] int<lower=0, upper=1> y;
+  array[N_sess] int<lower=0,upper=1> visit2;
 
-ep_excluded_subjects <- ep_qc %>%
-  filter(cor_z <= -ep_outlier_sd) %>%
-  pull(subject)
-
-er_model_data <- er_trials %>%
-  filter(!subject %in% ep_excluded_subjects)
-
-ep_subject_phase <- er_model_data %>%
-  group_by(subject, phase) %>%
-  summarise(
-    effort_slope = coef(lm(scale_rating ~ force))[2],
-    success_pct = 100 * mean(surpassed_goal, na.rm = TRUE),
-    mean_rt = mean(vas_rt, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-ep_curve_subject <- er_model_data %>%
-  group_by(subject, phase, force) %>%
-  summarise(mean_rating = mean(scale_rating, na.rm = TRUE), .groups = "drop")
-
-ep_curve_phase <- ep_curve_subject %>%
-  group_by(phase, force) %>%
-  summarise(
-    mean_rating = mean(mean_rating, na.rm = TRUE),
-    se = sd(mean_rating, na.rm = TRUE) / sqrt(sum(is.finite(mean_rating))),
-    .groups = "drop"
-  )
-
-ep_primary_test <- ep_subject_phase %>%
-  select(subject, phase, effort_slope) %>%
-  pivot_wider(names_from = phase, values_from = effort_slope) %>%
-  summarise(test = list(t.test(Follicular, Luteal, paired = TRUE))) %>%
-  pull(test) %>%
-  .[[1]]
-
-fit_ep_moderator <- function(moderator, label) {
-  dat <- er_model_data %>%
-    filter(is.finite(.data[[moderator]])) %>%
-    mutate(mod_z = z_score(.data[[moderator]]))
-
-  fit <- lmer(
-    scale_rating ~ force_c * phase * mod_z + trial_num_c * phase + (1 | subject),
-    data = dat,
-    REML = TRUE
-  )
-
-  tidy_lmm(fit, label)
+  array[T] real rew1;
+  array[T] real rew2;
+  array[T] real eff1;
+  array[T] real eff2;
 }
 
-ep_moderators <- bind_rows(
-  fit_ep_moderator("DRSP_Score", "EP_DRSP"),
-  fit_ep_moderator("arousal_mean_z", "EP_arousal_mean"),
-  fit_ep_moderator("arousal_sd_z", "EP_arousal_sd"),
-  fit_ep_moderator("valence_mean_z", "EP_valence_mean"),
-  fit_ep_moderator("valence_sd_z", "EP_valence_sd")
-)
+parameters {
+  vector[2] mu_base;                 // baseline means: [reward, effort]
+  vector[2] mu_visit;
+  vector[2] mu_phase;                // phase means:    [reward, effort]
 
-hrv_clean <- hrv_raw %>%
-  filter(subject %in% levels(er_model_data$subject)) %>%
-  mutate(
-    phase = factor(phase, levels = phase_levels),
-    hrv_baseline_ok = ecg_ok_baseline == TRUE & rr_clean_n_baseline >= min_rr_baseline,
-    hrv_active_ok = ecg_ok_active == TRUE & rr_clean_n_active >= min_rr_active,
-    hrv_baseline_z = z_score(log(hrv_baseline)),
-    hrv_active_z = z_score(log(hrv_active))
-  )
-
-ep_hrv_trials <- er_model_data %>%
-  inner_join(
-    hrv_clean %>%
-      filter(hrv_baseline_ok, hrv_active_ok) %>%
-      select(subject, session_id, phase, hrv_baseline_z, hrv_active_z),
-    by = c("subject", "session_id", "phase")
-  )
-
-fit_ep_hrv <- function(moderator, label) {
-  fit <- lmer(
-    scale_rating ~ force_c * phase * .data[[moderator]] + trial_num_c * phase + (1 | subject),
-    data = ep_hrv_trials,
-    REML = TRUE
-  )
-  tidy_lmm(fit, label)
+  vector<lower=0>[4] sigma_subj;     // SDs for 4 subject-level effects
+  cholesky_factor_corr[4] L_subj;    // correlations between them
+  matrix[4, N_subj] z_subj;          // subject latent z-scores
 }
 
-ep_hrv_models <- bind_rows(
-  fit_ep_hrv("hrv_baseline_z", "EP_hrv_baseline"),
-  fit_ep_hrv("hrv_active_z", "EP_hrv_active")
-)
+transformed parameters {
+  matrix[4, N_subj] subj_eff;
 
-# -----------------------------------------------------------------------------
-# DM
-# -----------------------------------------------------------------------------
+  vector[N_sess] rewSens;
+  vector[N_sess] effSens;
 
-dm_trials <- dm_trials_raw %>%
-  filter(subject %in% strict_phase_subjects, is_practice == 0) %>%
-  mutate(
-    subject = factor(subject),
-    phase = factor(phase, levels = phase_levels)
-  ) %>%
-  left_join(clinical_raw, by = c("subject", "session_id", "phase")) %>%
-  left_join(ema_raw, by = c("subject", "session_id", "phase"))
+  subj_eff = diag_pre_multiply(sigma_subj, L_subj) * z_subj;
 
-catch_trials <- dm_trials %>%
-  filter((reward1 > reward2 & effort1 < effort2) | (reward2 > reward1 & effort2 < effort1)) %>%
-  mutate(correct = case_when(
-    reward1 > reward2 & effort1 < effort2 & option_chosen == 0 ~ 1L,
-    reward2 > reward1 & effort2 < effort1 & option_chosen == 1 ~ 1L,
-    TRUE ~ 0L
-  )) %>%
-  group_by(subject, phase) %>%
-  summarise(n_errors = sum(correct == 0, na.rm = TRUE), .groups = "drop")
+  for (n in 1:N_sess) {
+    int s = subj[n];
+    real ph = phase[n];
 
-dm_excluded_subjects <- catch_trials %>%
-  filter(n_errors >= 2) %>%
-  distinct(subject) %>%
-  pull(subject)
+    real theta_rew =
+      mu_base[1] +
+      subj_eff[1, s] +
+      (mu_phase[1] + subj_eff[3, s]) * ph + mu_visit[1]*visit2[n];
 
-dm_trials_strict <- dm_trials %>%
-  filter(!subject %in% dm_excluded_subjects)
+    real theta_eff =
+      mu_base[2] +
+      subj_eff[2, s] +
+      (mu_phase[2] + subj_eff[4, s]) * ph + mu_visit[2]*visit2[n];
 
-dm_choice_space <- dm_trials_strict %>%
-  mutate(
-    hard_reward = ifelse(effort1 > effort2, reward1, reward2),
-    hard_effort = ifelse(effort1 > effort2, effort1, effort2),
-    choose_hard = ifelse(
-      (effort1 > effort2 & option_chosen == 0) | (effort2 > effort1 & option_chosen == 1),
-      1, 0
+    rewSens[n] = exp(theta_rew);
+    effSens[n] = exp(theta_eff);
+  }
+}
+
+model {
+  mu_base ~ normal(0, 1);
+  mu_phase ~ normal(0, 0.5);
+  mu_visit ~ normal(0,0.5);
+
+  sigma_subj ~ exponential(1);
+  L_subj ~ lkj_corr_cholesky(2.0);
+
+  to_vector(z_subj) ~ std_normal();
+
+  for (n in 1:N_sess) {
+    for (t in 1:T) {
+      real V1;
+      real V2;
+
+      V1 = rewSens[n] * rew1[t] - effSens[n] * square(eff1[t]);
+      V2 = rewSens[n] * rew2[t] - effSens[n] * square(eff2[t]);
+
+      y[n, t] ~ bernoulli_logit(V2 - V1);
+    }
+  }
+}
+
+generated quantities {
+  real delta_rew = mu_phase[1];
+  real delta_eff = mu_phase[2];
+
+  real delta_rew_exp = exp(mu_phase[1]);
+  real delta_eff_exp = exp(mu_phase[2]);
+
+  corr_matrix[4] Omega_subj;
+  vector[N_sess] rewSens_sess;
+  vector[N_sess] effSens_sess;
+
+  real ybar_rep = 0;
+  real ybar_obs = 0;
+  int total = 0;
+
+  Omega_subj = multiply_lower_tri_self_transpose(L_subj);
+
+  for (n in 1:N_sess) {
+    rewSens_sess[n] = rewSens[n];
+    effSens_sess[n] = effSens[n];
+  }
+
+  for (n in 1:N_sess) {
+    for (t in 1:T) {
+      real V1;
+      real V2;
+      real p;
+      int y_rep;
+
+      V1 = rewSens[n] * rew1[t] - effSens[n] * square(eff1[t]);
+      V2 = rewSens[n] * rew2[t] - effSens[n] * square(eff2[t]);
+
+      p = inv_logit(V2 - V1);
+      y_rep = bernoulli_rng(p);
+
+      ybar_rep += y_rep;
+      ybar_obs += y[n, t];
+      total += 1;
+    }
+  }
+
+  ybar_rep /= total;
+  ybar_obs /= total;
+}
+
+)"
+
+# ============================================================================
+# 5. Model fitting and diagnostics
+# ============================================================================
+# Both model specifications are embedded above. The script writes them to the
+# output directory, compiles them, and samples the posterior from the choices.
+# Posterior summaries and sampler diagnostics are saved for assessment.
+# Diagnostics never change the observations, seed, or model automatically.
+
+fit_choice_model <- function(stan_code, stan_data, sampling, output_dir, model_name) {
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  model_file <- file.path(output_dir, paste0(model_name, ".stan"))
+  writeLines(stan_code, model_file, useBytes = TRUE)
+  cmdstanr::write_stan_json(stan_data, file.path(output_dir, "stan_data.json"))
+  model <- cmdstanr::cmdstan_model(model_file)
+  fit <- do.call(model$sample, c(
+    list(data = stan_data, output_dir = output_dir, output_basename = model_name,
+         refresh = 500L), sampling
+  ))
+  fit$save_object(file.path(output_dir, "fit.rds"))
+  readr::write_csv(fit$summary(), file.path(output_dir, "posterior_diagnostics.csv"))
+  diagnostics <- fit$diagnostic_summary()
+  writeLines(capture.output(diagnostics), file.path(output_dir, "sampler_diagnostics.txt"))
+  readr::write_csv(as.data.frame(sampling), file.path(output_dir, "sampling_settings.csv"))
+  invisible(fit)
+}
+
+# ============================================================================
+# 6. Posterior contrasts and participant/session estimates
+# ============================================================================
+# Population contrasts are on the log-sensitivity scale, ML minus LF.
+# Intervals are equal-tailed 95% credible intervals; prob_positive is the
+# proportion of actual posterior draws above zero. Session sensitivities are
+# posterior means on the positive sensitivity scale, not log sensitivities.
+
+summarise_draws <- function(draws, parameters) {
+  do.call(rbind, lapply(parameters, function(parameter) {
+    values <- draws[, parameter]
+    data.frame(
+      parameter = parameter,
+      mean = mean(values),
+      lower = unname(stats::quantile(values, 0.025)),
+      upper = unname(stats::quantile(values, 0.975)),
+      prob_positive = mean(values > 0)
     )
-  ) %>%
-  group_by(subject, phase, hard_reward, hard_effort) %>%
-  summarise(p_choose_hard = mean(choose_hard, na.rm = TRUE), .groups = "drop") %>%
-  group_by(phase, hard_reward, hard_effort) %>%
-  summarise(p_choose_hard = mean(p_choose_hard, na.rm = TRUE), n_total = n(), .groups = "drop") %>%
-  pivot_wider(names_from = phase, values_from = c(p_choose_hard, n_total)) %>%
-  mutate(
-    diff_pp = 100 * (p_choose_hard_Luteal - p_choose_hard_Follicular),
-    n_total = coalesce(n_total_Follicular, 0) + coalesce(n_total_Luteal, 0)
-  ) %>%
-  filter(is.finite(diff_pp))
-
-dm_session_params <- read_csv_clean(file.path(raw_dir, "dm_session_parameters.csv")) %>%
-  filter(subject %in% strict_phase_subjects, !subject %in% dm_excluded_subjects) %>%
-  mutate(
-    subject = factor(subject),
-    phase = factor(phase, levels = phase_levels),
-    effSens_z = z_score(effSens),
-    rewSens_z = z_score(rewSens)
-  ) %>%
-  left_join(clinical_raw, by = c("subject", "session_id", "phase")) %>%
-  left_join(ema_raw, by = c("subject", "session_id", "phase")) %>%
-  left_join(
-    hrv_clean %>% select(subject, session_id, phase, hrv_baseline_z, hrv_active_z),
-    by = c("subject", "session_id", "phase")
-  )
-
-require_columns(dm_session_params, c("effSens", "rewSens"), "dm_session_parameters")
-
-dm_phase_summary <- read_csv_clean(file.path(raw_dir, "dm_phase_population_effect.csv"))
-require_columns(dm_phase_summary, c("term", "estimate", "ci_low", "ci_high"), "dm_phase_population_effect")
-
-fit_dm_moderator <- function(outcome, moderator, label) {
-  dat <- dm_session_params %>%
-    filter(is.finite(.data[[outcome]]), is.finite(.data[[moderator]])) %>%
-    mutate(
-      outcome_z = z_score(.data[[outcome]]),
-      mod_z = z_score(.data[[moderator]])
-    )
-
-  fit <- lmer(
-    outcome_z ~ phase * mod_z + (1 | subject),
-    data = dat,
-    REML = TRUE
-  )
-
-  tidy_lmm(fit, label)
+  }))
 }
 
-dm_moderators <- bind_rows(
-  fit_dm_moderator("effSens", "DRSP_Score", "DM_eff_DRSP"),
-  fit_dm_moderator("effSens", "arousal_mean_z", "DM_eff_arousal_mean"),
-  fit_dm_moderator("effSens", "arousal_sd_z", "DM_eff_arousal_sd"),
-  fit_dm_moderator("effSens", "valence_mean_z", "DM_eff_valence_mean"),
-  fit_dm_moderator("effSens", "valence_sd_z", "DM_eff_valence_sd"),
-  fit_dm_moderator("effSens", "hrv_baseline_z", "DM_eff_hrv_baseline"),
-  fit_dm_moderator("effSens", "hrv_active_z", "DM_eff_hrv_active"),
-  fit_dm_moderator("rewSens", "DRSP_Score", "DM_rew_DRSP"),
-  fit_dm_moderator("rewSens", "arousal_mean_z", "DM_rew_arousal_mean"),
-  fit_dm_moderator("rewSens", "arousal_sd_z", "DM_rew_arousal_sd"),
-  fit_dm_moderator("rewSens", "valence_mean_z", "DM_rew_valence_mean"),
-  fit_dm_moderator("rewSens", "valence_sd_z", "DM_rew_valence_sd"),
-  fit_dm_moderator("rewSens", "hrv_baseline_z", "DM_rew_hrv_baseline"),
-  fit_dm_moderator("rewSens", "hrv_active_z", "DM_rew_hrv_active")
-)
+export_choice_results <- function(fit, sessions, output_dir, include_visit = FALSE) {
+  parameters <- c("delta_eff", "delta_rew")
+  if (include_visit) parameters <- c(parameters, "mu_visit[1]", "mu_visit[2]")
+  draws <- fit$draws(variables = c("delta_eff", "delta_rew",
+                                  if (include_visit) "mu_visit",
+                                  "effSens_sess", "rewSens_sess"), format = "matrix")
+  contrasts <- summarise_draws(draws, parameters)
+  contrasts$contrast <- c("phase_effort_ML_minus_LF", "phase_reward_ML_minus_LF",
+                         if (include_visit) c("visit_reward_2_minus_1", "visit_effort_2_minus_1"))
+  estimates <- sessions
+  estimates$effSens <- vapply(sessions$session_idx, function(i) {
+    mean(draws[, paste0("effSens_sess[", i, "]")])
+  }, numeric(1))
+  estimates$rewSens <- vapply(sessions$session_idx, function(i) {
+    mean(draws[, paste0("rewSens_sess[", i, "]")])
+  }, numeric(1))
+  readr::write_csv(contrasts, file.path(output_dir, "population_contrasts.csv"))
+  readr::write_csv(estimates, file.path(output_dir, "session_parameters.csv"))
+  readr::write_csv(as.data.frame(draws[, parameters, drop = FALSE]),
+                   file.path(output_dir, "contrast_draws.csv"))
+  print(contrasts, digits = 6)
+  invisible(contrasts)
+}
 
-# -----------------------------------------------------------------------------
-# Outputs
-# -----------------------------------------------------------------------------
+# ============================================================================
+# 7. Behavioural chronological-visit models
+# ============================================================================
+# Each participant/session contributes:
+#   success_pct = 100 * successful executed trials / recorded executed trials
+#   hard_pct    = 100 * choices of the higher-effort option / all test choices
+# Missing or unrecognised execution flags are not counted as executed. Their
+# choices remain in the choice model. Success must be known on executed trials.
+# Equal-effort offers, if present, do not count as higher-effort choices.
+# Both outcomes use outcome ~ phase + visit2 + (1 | participant).
+# Models use REML, Satterthwaite degrees of freedom and two-sided t inference;
+# confidence intervals are 95% Wald intervals from broom.mixed::tidy.
+# Coefficients for these outcomes are percentage-point differences.
 
-write_csv(er_model_data, file.path(processed_dir, "er_model_data.csv"))
-write_csv(ep_subject_phase, file.path(processed_dir, "ep_subject_phase.csv"))
-write_csv(ep_moderators, file.path(models_dir, "ep_moderators.csv"))
-write_csv(ep_hrv_models, file.path(models_dir, "ep_hrv_models.csv"))
-write_csv(hrv_clean, file.path(processed_dir, "hrv_subject_phase_clean.csv"))
+parse_binary_flag <- function(values) {
+  values <- tolower(as.character(values))
+  ifelse(values %in% c("1", "true"), 1L,
+         ifelse(values %in% c("0", "false"), 0L, NA_integer_))
+}
 
-write_csv(dm_trials_strict, file.path(processed_dir, "dm_trials_strict.csv"))
-write_csv(dm_session_params, file.path(processed_dir, "dm_session_params.csv"))
-write_csv(dm_choice_space, file.path(processed_dir, "dm_choice_space.csv"))
-write_csv(dm_moderators, file.path(models_dir, "dm_moderators.csv"))
+prepare_behaviour_data <- function(trials) {
+  x <- trials
+  x$executed <- parse_binary_flag(x$is_force_exerted)
+  x$success <- parse_binary_flag(x$surpassed_goal)
+  require_condition(!anyNA(x$success[x$executed %in% 1L]),
+                    "Success must be recorded on every executed trial.")
+  x$hard <- ifelse(x$option_chosen == 0, x$effort1 > x$effort2, x$effort2 > x$effort1)
+  b <- x |>
+    dplyr::group_by(participant_id, phase, visit) |>
+    dplyr::summarise(
+      n_choices = dplyr::n(),
+      n_executed = sum(executed %in% 1L),
+      n_execution_unknown = sum(is.na(executed)),
+      n_successful = sum(success[executed %in% 1L]),
+      success_pct = 100 * mean(success[executed %in% 1L]),
+      hard_pct = 100 * mean(hard), .groups = "drop"
+    ) |>
+    dplyr::mutate(participant_id = factor(participant_id),
+                  phase = factor(phase, levels = c("Follicular", "Luteal")),
+                  visit2 = as.integer(visit) - 1L)
+  require_condition(all(b$n_executed > 0L) && all(is.finite(b$success_pct)),
+                    "Every session needs at least one recorded executed trial for success analysis.")
+  if (any(b$n_execution_unknown > 0L)) {
+    message(sum(b$n_execution_unknown),
+            " execution flags are missing/unrecognised; denominators are saved per session.")
+  }
+  b
+}
 
-analysis_counts <- tibble(
-  metric = c(
-    "strict_phase_subjects",
-    "ep_subjects_after_qc",
-    "ep_hrv_subjects_after_qc",
-    "dm_subjects_after_catch_qc"
-  ),
-  value = c(
-    length(strict_phase_subjects),
-    n_distinct(er_model_data$subject),
-    n_distinct(ep_hrv_trials$subject),
-    n_distinct(dm_trials_strict$subject)
+fit_behaviour_models <- function(data, output_dir) {
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  readr::write_csv(data, file.path(output_dir, "behaviour_session_summaries.csv"))
+  results <- lapply(c("success_pct", "hard_pct"), function(outcome) {
+    formula <- stats::as.formula(paste(outcome, "~ phase + visit2 + (1 | participant_id)"))
+    fit <- lmerTest::lmer(
+      formula, data = data, REML = TRUE,
+      contrasts = list(phase = stats::contr.treatment(c("Follicular", "Luteal"), base = 1))
+    )
+    saveRDS(fit, file.path(output_dir, paste0(outcome, "_fit.rds")))
+    writeLines(capture.output(summary(fit)),
+               file.path(output_dir, paste0(outcome, "_model_summary.txt")))
+    broom.mixed::tidy(fit, effects = "fixed", conf.int = TRUE,
+                       conf.level = 0.95, conf.method = "Wald") |>
+      dplyr::mutate(outcome = outcome)
+  }) |>
+    dplyr::bind_rows()
+  readr::write_csv(results, file.path(output_dir, "behaviour_fixed_effects.csv"))
+  print(dplyr::filter(results, term == "visit2"))
+  invisible(results)
+}
+
+# ============================================================================
+# 8. Run the analysis in order and save outputs
+# ============================================================================
+# Output folders:
+#   primary/     Stan source, fitted model, actual posterior draws, population
+#                contrasts, session estimates, and sampling diagnostics.
+#   visit/       Corresponding outputs with chronological visit adjustment.
+#   behaviour/   Session denominators, fitted mixed models, fixed-effect tables.
+# Top-level files record sample counts, the offer template, session indexing,
+# and software versions. There are no expected-result targets in the analysis.
+
+run_analysis <- function(input_file = INPUT_FILE, output_dir = OUTPUT_DIR,
+                         include_visit = RUN_VISIT_ANALYSES) {
+  packages <- check_packages(include_visit)
+  prepared <- prepare_choice_data(input_file, include_visit)
+  # Validate behavioural input before starting the more expensive sampling.
+  if (include_visit) behaviour <- prepare_behaviour_data(prepared$trials)
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  versions <- data.frame(
+    component = c("R", "CmdStan", packages),
+    version = c(as.character(getRversion()), as.character(cmdstanr::cmdstan_version()),
+                vapply(packages, function(p) as.character(utils::packageVersion(p)), character(1)))
   )
-)
+  readr::write_csv(versions, file.path(output_dir, "software_versions.csv"))
+  readr::write_csv(data.frame(
+    participants = prepared$stan_data$N_subj, sessions = prepared$stan_data$N_sess,
+    choices = nrow(prepared$trials), choices_per_session = TRIALS_PER_SESSION
+  ), file.path(output_dir, "sample_counts.csv"))
+  readr::write_csv(prepared$sessions, file.path(output_dir, "session_index.csv"))
+  readr::write_csv(prepared$template, file.path(output_dir, "offer_template.csv"))
 
-write_csv(analysis_counts, file.path(tables_dir, "analysis_counts.csv"))
+  primary_dir <- file.path(output_dir, "primary")
+  primary_fit <- fit_choice_model(PRIMARY_STAN_CODE, prepared$stan_data,
+                                   PRIMARY_SAMPLING, primary_dir, "dm_primary")
+  primary_results <- export_choice_results(primary_fit, prepared$sessions, primary_dir)
 
-# -----------------------------------------------------------------------------
-# Figures
-# -----------------------------------------------------------------------------
+  if (include_visit) {
+    visit_data <- prepared$stan_data
+    visit_data$visit2 <- as.integer(prepared$sessions$visit) - 1L
+    visit_dir <- file.path(output_dir, "visit")
+    visit_fit <- fit_choice_model(VISIT_STAN_CODE, visit_data, VISIT_SAMPLING,
+                                  visit_dir, "dm_phase_visit")
+    export_choice_results(visit_fit, prepared$sessions, visit_dir, include_visit = TRUE)
+    fit_behaviour_models(behaviour, file.path(output_dir, "behaviour"))
+  }
+  message("Analysis complete. Outputs: ", output_dir)
+  invisible(primary_results)
+}
 
-ep_curve_plot <- ggplot(ep_curve_subject, aes(x = force, y = mean_rating, group = interaction(subject, phase), color = phase)) +
-  geom_line(alpha = 0.08, linewidth = 0.40, show.legend = FALSE) +
-  geom_ribbon(
-    data = ep_curve_phase,
-    aes(x = force, ymin = mean_rating - 1.96 * se, ymax = mean_rating + 1.96 * se, fill = phase, group = phase),
-    inherit.aes = FALSE,
-    alpha = 0.18,
-    colour = NA
-  ) +
-  geom_line(data = ep_curve_phase, aes(group = phase), inherit.aes = FALSE, linewidth = 1.35) +
-  geom_point(data = ep_curve_phase, size = 2.1, inherit.aes = FALSE) +
-  scale_color_manual(values = c(Follicular = col_fol, Luteal = col_lut), labels = phase_labels) +
-  scale_fill_manual(values = c(Follicular = col_fol_soft, Luteal = col_lut_soft), labels = phase_labels) +
-  scale_x_continuous(breaks = sort(unique(ep_curve_phase$force))) +
-  labs(x = "Required force (%MVC)", y = "Subjective effort rating") +
-  theme_pub()
-
-ep_slope_plot <- ggplot(ep_subject_phase, aes(x = phase, y = effort_slope, group = subject)) +
-  geom_line(color = "grey82", linewidth = 0.7, alpha = 0.9) +
-  geom_point(aes(color = phase), size = 2.2, alpha = 0.85) +
-  stat_summary(aes(group = 1), fun = mean, geom = "line", color = "black", linewidth = 1.4) +
-  stat_summary(aes(group = 1), fun.data = mean_cl_normal, geom = "errorbar", width = 0.08, color = "black", linewidth = 0.9) +
-  stat_summary(aes(group = 1), fun = mean, geom = "point", shape = 21, fill = "white", color = "black", size = 3.4, stroke = 1.1) +
-  scale_color_manual(values = c(Follicular = col_fol, Luteal = col_lut), labels = phase_labels) +
-  scale_x_discrete(labels = phase_labels) +
-  labs(x = NULL, y = "Effort differentiation slope") +
-  theme_pub()
-
-dm_eff_fol_draw <- boot_mean_draws(dm_session_params$effSens[dm_session_params$phase == "Follicular"], seed = seed_base)
-dm_eff_lut_draw <- boot_mean_draws(dm_session_params$effSens[dm_session_params$phase == "Luteal"], seed = seed_base + 1L)
-dm_rew_fol_draw <- boot_mean_draws(dm_session_params$rewSens[dm_session_params$phase == "Follicular"], seed = seed_base + 2L)
-dm_rew_lut_draw <- boot_mean_draws(dm_session_params$rewSens[dm_session_params$phase == "Luteal"], seed = seed_base + 3L)
-
-dm_eff_delta_draw <- summary_to_draws(
-  mean = dm_phase_summary$estimate[dm_phase_summary$term == "effort_sensitivity_phase_difference"],
-  lower = dm_phase_summary$ci_low[dm_phase_summary$term == "effort_sensitivity_phase_difference"],
-  upper = dm_phase_summary$ci_high[dm_phase_summary$term == "effort_sensitivity_phase_difference"],
-  seed = seed_base + 4L
-)
-
-dm_rew_delta_draw <- summary_to_draws(
-  mean = dm_phase_summary$estimate[dm_phase_summary$term == "reward_sensitivity_phase_difference"],
-  lower = dm_phase_summary$ci_low[dm_phase_summary$term == "reward_sensitivity_phase_difference"],
-  upper = dm_phase_summary$ci_high[dm_phase_summary$term == "reward_sensitivity_phase_difference"],
-  seed = seed_base + 5L
-)
-
-dm_phase_draws <- bind_rows(
-  tibble(term = "Late-follicular mean effort sensitivity", family = "follicular", value = dm_eff_fol_draw),
-  tibble(term = "Mid-luteal mean effort sensitivity", family = "luteal", value = dm_eff_lut_draw),
-  tibble(term = "Late-follicular mean reward sensitivity", family = "follicular", value = dm_rew_fol_draw),
-  tibble(term = "Mid-luteal mean reward sensitivity", family = "luteal", value = dm_rew_lut_draw),
-  tibble(term = "Mid-luteal - late-follicular effort sensitivity", family = "contrast", value = dm_eff_delta_draw),
-  tibble(term = "Mid-luteal - late-follicular reward sensitivity", family = "contrast", value = dm_rew_delta_draw)
-)
-
-dm_posterior_plot <- ggplot(dm_phase_draws, aes(x = value, y = term, fill = family)) +
-  ggdist::stat_gradientinterval(.width = c(.9, .5), slab_size = 1) +
-  scale_fill_manual(values = c(follicular = col_fol, luteal = col_lut, contrast = col_contrast)) +
-  labs(x = "Posterior parameter estimate", y = NULL) +
-  theme_pub()
-
-save_plot_pair(tag_panel(ep_curve_plot, "A") | tag_panel(ep_slope_plot, "B"), "ep_core_panels", 11, 4.8)
-save_plot_pair(dm_posterior_plot, "dm_posterior_panels", 8.5, 5.2)
-
-message("Pipeline completed.")
+if (sys.nframe() == 0L) run_analysis()
